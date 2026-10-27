@@ -10,3 +10,5 @@ export * from './core/fsm.js';
 export * from './core/hasher.js';
 export * from './storage/interface.js';
 export * from './storage/memory.js';
+export * from './storage/postgres.js';
+export * from './db/migrator.js';
