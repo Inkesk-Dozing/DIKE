@@ -6,3 +6,7 @@
 export const DIKE_VERSION = '0.1.0';
 
 export * from './core/types.js';
+export * from './core/fsm.js';
+export * from './core/hasher.js';
+export * from './storage/interface.js';
+export * from './storage/memory.js';
