@@ -1,0 +1,5 @@
+# DIKE Codeowners Specification
+# Lines matching patterns assign mandatory reviewers and owners.
+# Syntax: pattern @owner1 @owner2
+
+* @kush05bhardwaj @mrinalprakashfsd

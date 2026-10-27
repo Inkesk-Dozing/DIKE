@@ -1,0 +1,38 @@
+PROPRIETARY LICENSE AGREEMENT
+
+Copyright (c) 2026 Kushagra Bhardwaj (@kush05bhardwaj) and Mrinal Prakash (@mrinalprakashfsd).
+All Rights Reserved.
+
+NOTICE: This codebase, architecture, documentation, and all associated software assets 
+comprising the Distributed Idempotency Key Engine (DIKE) are the exclusive proprietary property 
+of the designated Codeowners:
+- Kushagra Bhardwaj (GitHub: @kush05bhardwaj / @Kush05Bhardwaj)
+- Mrinal Prakash (GitHub: @mrinalprakashfsd / @MRINALPRAKASHFSD)
+
+TERMS AND CONDITIONS OF USE:
+
+1. OWNERSHIP:
+   The software, design systems, algorithms, source code, data models, and documentation 
+   contained herein remain the sole intellectual property of the Codeowners. No title, 
+   license, or interest in or to the software is transferred to any third party.
+
+2. RESTRICTIONS ON USE, MODIFICATION, AND REDISTRIBUTION:
+   Except as expressly authorized in writing signed by both Codeowners:
+   - You may not copy, reproduce, distribute, sub-license, rent, lease, or lend the software.
+   - You may not modify, adapt, alter, translate, or create derivative works based upon the software.
+   - You may not reverse-engineer, decompile, disassemble, or derive source code from any 
+     compiled binary or distributed artifact of the software.
+   - You may not use the software or any portion thereof for commercial distribution, SaaS hosting, 
+     or external service delivery without an explicit commercial license agreement.
+
+3. CONFIDENTIALITY:
+   All proprietary algorithms, connection parking mechanics, streaming hashing implementations, 
+   and architectural blueprints are considered confidential and proprietary trade secrets.
+
+4. DISCLAIMER OF WARRANTIES:
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+   INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+   PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE CODEOWNERS OR COPYRIGHT HOLDERS BE 
+   LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, 
+   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE 
+   OR OTHER DEALINGS IN THE SOFTWARE.
