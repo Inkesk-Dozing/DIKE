@@ -12,6 +12,7 @@ import { IIdempotencyStorage } from '../storage/interface.js';
 import { MemoryStorageAdapter } from '../storage/memory.js';
 import { ietfHeadersPlugin } from './plugins/ietf_headers.js';
 import { idempotencyRoutes } from './routes/idempotency.js';
+import { DEFAULT_REDACT_PATHS, generateTraceId, REDACTED_MASK } from '../utils/logger.js';
 
 export interface AppOptions {
   readonly config?: Partial<ServerConfig> | undefined;
@@ -22,12 +23,29 @@ export interface StorageHealthCapable {
   healthCheck?(): Promise<boolean>;
 }
 
+declare module 'fastify' {
+  interface FastifyRequest {
+    traceId: string;
+  }
+}
+
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const config = { ...loadConfig(), ...(options.config ?? {}) };
   const storage = options.storage ?? new MemoryStorageAdapter();
 
   const app: FastifyInstance = fastify({
-    logger: config.LOG_LEVEL === 'silent' ? false : { level: config.LOG_LEVEL },
+    logger:
+      config.LOG_LEVEL === 'silent'
+        ? false
+        : {
+            level: config.LOG_LEVEL,
+            redact: {
+              paths: DEFAULT_REDACT_PATHS,
+              censor: REDACTED_MASK,
+            },
+          },
+    genReqId: (req) => (req.headers['x-trace-id'] as string) || generateTraceId(),
+    requestIdHeader: 'x-trace-id',
   });
 
   // Security Headers and Cross-Origin Resource Sharing
@@ -38,6 +56,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await app.register(cors, {
     origin: true,
     credentials: true,
+  });
+
+  // Trace ID Decorator and Response Header Hook
+  app.addHook('onRequest', async (req: FastifyRequest, reply: FastifyReply) => {
+    req.traceId = req.id;
+    reply.header('x-trace-id', req.id);
   });
 
   // IETF Idempotency-Key Standard HTTP Header Compliance Plugin
