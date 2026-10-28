@@ -15,3 +15,4 @@ export * from './db/migrator.js';
 export * from './server/config.js';
 export * from './server/app.js';
 export * from './server/routes/idempotency.js';
+export * from './server/plugins/ietf_headers.js';
