@@ -10,6 +10,7 @@ import helmet from '@fastify/helmet';
 import { loadConfig, ServerConfig } from './config.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { MemoryStorageAdapter } from '../storage/memory.js';
+import { idempotencyRoutes } from './routes/idempotency.js';
 
 export interface AppOptions {
   readonly config?: Partial<ServerConfig> | undefined;
@@ -41,6 +42,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Global Context Decorators
   app.decorate('config', config);
   app.decorate('storage', storage);
+
+  // Register Core REST Routes
+  await app.register(idempotencyRoutes);
 
   // Standardized Error Handler
   app.setErrorHandler((error: Error & { statusCode?: number }, _req: FastifyRequest, reply: FastifyReply) => {
