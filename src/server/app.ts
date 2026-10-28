@@ -10,6 +10,7 @@ import helmet from '@fastify/helmet';
 import { loadConfig, ServerConfig } from './config.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { MemoryStorageAdapter } from '../storage/memory.js';
+import { ietfHeadersPlugin } from './plugins/ietf_headers.js';
 import { idempotencyRoutes } from './routes/idempotency.js';
 
 export interface AppOptions {
@@ -38,6 +39,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     origin: true,
     credentials: true,
   });
+
+  // IETF Idempotency-Key Standard HTTP Header Compliance Plugin
+  await app.register(ietfHeadersPlugin);
 
   // Global Context Decorators
   app.decorate('config', config);
