@@ -1,10 +1,10 @@
 /**
- * PostgreSQL L3 ACID Storage Adapter for DIKE
- * Provides durable, persistent transactional guarantees and row-level locking for idempotency keys.
+ * PostgreSQL L3 Relational Storage Adapter for DIKE
+ * Provides ACID durability, row-level locking (SELECT ... FOR UPDATE), GiST indexes, and zombie writer fencing.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
-import pg, { Pool, PoolConfig } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { IIdempotencyStorage } from './interface.js';
 import {
   IdempotencyRecord,
@@ -12,35 +12,36 @@ import {
   AcquireResult,
   ResolveOptions,
   AbortOptions,
-  FencingTokenViolationError,
 } from '../core/types.js';
+import { FencingTokenGuard } from '../core/fencing.js';
 
 export interface PostgresStorageOptions {
+  readonly connectionString?: string | undefined;
   readonly pool?: Pool | undefined;
-  readonly poolConfig?: PoolConfig | undefined;
+  readonly maxPoolSize?: number | undefined;
   readonly defaultLockTimeoutMs?: number | undefined;
 }
 
 interface DBRecordRow {
-  id: string;
-  tenant_id: string;
-  idempotency_key: string;
-  request_fingerprint: string;
-  status: 'STARTED' | 'RESOLVED' | 'FAILED';
-  response_status: number | null;
-  response_headers: Record<string, string> | null;
-  response_body: unknown | null;
-  fencing_token: string | number | bigint;
-  locked_until: Date | null;
-  expires_at: Date;
-  created_at: Date;
-  updated_at: Date;
+  readonly id: string;
+  readonly tenant_id: string;
+  readonly idempotency_key: string;
+  readonly request_fingerprint: string;
+  readonly status: IdempotencyRecord['status'];
+  readonly response_status: number | null;
+  readonly response_headers: Record<string, string> | null;
+  readonly response_body: unknown | null;
+  readonly fencing_token: string;
+  readonly locked_until: Date | null;
+  readonly expires_at: Date;
+  readonly created_at: Date;
+  readonly updated_at: Date;
 }
 
 export class PostgresStorageAdapter implements IIdempotencyStorage {
   private readonly pool: Pool;
-  private readonly ownsPool: boolean;
   private readonly defaultLockTimeoutMs: number;
+  private readonly ownsPool: boolean;
 
   constructor(options: PostgresStorageOptions = {}) {
     this.defaultLockTimeoutMs = options.defaultLockTimeoutMs ?? 30_000;
@@ -48,7 +49,10 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
       this.pool = options.pool;
       this.ownsPool = false;
     } else {
-      this.pool = new pg.Pool(options.poolConfig);
+      this.pool = new Pool({
+        connectionString: options.connectionString || process.env['DATABASE_URL'] || 'postgresql://postgres:postgres@localhost:5432/dike_dev',
+        max: options.maxPoolSize || 20,
+      });
       this.ownsPool = true;
     }
   }
@@ -63,8 +67,8 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
       responseStatus: row.response_status ?? undefined,
       responseHeaders: row.response_headers ?? undefined,
       responseBody: row.response_body ?? undefined,
-      fencingToken: row.fencing_token ? BigInt(row.fencing_token) : undefined,
-      lockedUntil: row.locked_until ?? undefined,
+      fencingToken: BigInt(row.fencing_token),
+      lockedUntil: row.locked_until ? new Date(row.locked_until) : undefined,
       expiresAt: new Date(row.expires_at),
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
@@ -72,16 +76,16 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
   }
 
   public async acquire(options: AcquireOptions): Promise<AcquireResult> {
-    const client = await this.pool.connect();
+    const client: PoolClient = await this.pool.connect();
     const now = new Date();
-    const lockTimeoutMs = options.lockTimeoutMs ?? this.defaultLockTimeoutMs;
-    const lockedUntil = new Date(now.getTime() + Math.min(options.ttlMs, lockTimeoutMs));
+    const lockDuration = options.lockTimeoutMs ?? this.defaultLockTimeoutMs;
+    const lockedUntil = new Date(now.getTime() + Math.min(options.ttlMs, lockDuration));
     const expiresAt = new Date(now.getTime() + options.ttlMs);
 
     try {
       await client.query('BEGIN');
 
-      // Row-level lock acquisition
+      // Row-level lock acquisition on tenant + idempotency key
       const selectRes = await client.query<DBRecordRow>(
         `SELECT * FROM idempotency_records 
          WHERE tenant_id = $1 AND idempotency_key = $2 
@@ -89,100 +93,101 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
         [options.tenantId, options.key]
       );
 
-      if (selectRes.rows.length === 0) {
-        // Fresh insertion
-        const insertRes = await client.query<DBRecordRow>(
-          `INSERT INTO idempotency_records (
-            tenant_id, idempotency_key, request_fingerprint, status, 
-            fencing_token, locked_until, expires_at, created_at, updated_at
-           ) VALUES ($1, $2, $3, 'STARTED', 1, $4, $5, $6, $6)
-           RETURNING *`,
-          [options.tenantId, options.key, options.requestFingerprint, lockedUntil, expiresAt, now]
-        );
+      if (selectRes.rows.length > 0) {
+        const existing = this.mapRowToRecord(selectRes.rows[0]!);
 
-        await client.query('COMMIT');
-        const insertedRecord = this.mapRowToRecord(insertRes.rows[0]!);
-        return {
-          status: 'ACQUIRED',
-          record: insertedRecord,
-          fencingToken: 1n,
-        };
-      }
-
-      const existingRow = selectRes.rows[0]!;
-      const existing = this.mapRowToRecord(existingRow);
-
-      // Check if expired
-      if (existing.expiresAt.getTime() <= now.getTime()) {
-        const updateRes = await client.query<DBRecordRow>(
-          `UPDATE idempotency_records 
-           SET request_fingerprint = $1, status = 'STARTED', fencing_token = fencing_token + 1,
-               locked_until = $2, expires_at = $3, response_status = NULL, 
-               response_headers = NULL, response_body = NULL, updated_at = $4
-           WHERE tenant_id = $5 AND idempotency_key = $6
-           RETURNING *`,
-          [options.requestFingerprint, lockedUntil, expiresAt, now, options.tenantId, options.key]
-        );
-        await client.query('COMMIT');
-        const record = this.mapRowToRecord(updateRes.rows[0]!);
-        return {
-          status: 'ACQUIRED',
-          record,
-          fencingToken: record.fencingToken,
-        };
-      }
-
-      if (existing.status === 'RESOLVED') {
-        await client.query('COMMIT');
-        if (existing.requestFingerprint !== options.requestFingerprint) {
-          return { status: 'PAYLOAD_MISMATCH', record: existing };
+        // Check if expired
+        if (existing.expiresAt.getTime() <= now.getTime()) {
+          const updateRes = await client.query<DBRecordRow>(
+            `UPDATE idempotency_records 
+             SET request_fingerprint = $1, status = 'STARTED', fencing_token = fencing_token + 1,
+                 locked_until = $2, expires_at = $3, response_status = NULL, 
+                 response_headers = NULL, response_body = NULL, updated_at = $4
+             WHERE tenant_id = $5 AND idempotency_key = $6
+             RETURNING *`,
+            [options.requestFingerprint, lockedUntil, expiresAt, now, options.tenantId, options.key]
+          );
+          await client.query('COMMIT');
+          const record = this.mapRowToRecord(updateRes.rows[0]!);
+          return {
+            status: 'ACQUIRED',
+            record,
+            fencingToken: record.fencingToken,
+          };
         }
-        return { status: 'CACHED', record: existing };
-      }
 
-      if (existing.status === 'STARTED') {
-        const isLocked = existing.lockedUntil && existing.lockedUntil.getTime() > now.getTime();
-        if (isLocked) {
+        if (existing.status === 'RESOLVED') {
           await client.query('COMMIT');
           if (existing.requestFingerprint !== options.requestFingerprint) {
             return { status: 'PAYLOAD_MISMATCH', record: existing };
           }
+          return { status: 'CACHED', record: existing };
+        }
+
+        if (existing.status === 'STARTED') {
+          const isLocked = existing.lockedUntil && existing.lockedUntil.getTime() > now.getTime();
+          if (isLocked) {
+            await client.query('COMMIT');
+            if (existing.requestFingerprint !== options.requestFingerprint) {
+              return { status: 'PAYLOAD_MISMATCH', record: existing };
+            }
+            return {
+              status: 'IN_PROGRESS',
+              record: existing,
+              fencingToken: existing.fencingToken,
+            };
+          }
+
+          // Lock expired: take over lease
+          const updateRes = await client.query<DBRecordRow>(
+            `UPDATE idempotency_records 
+             SET status = 'STARTED', fencing_token = fencing_token + 1,
+                 locked_until = $1, expires_at = $2, request_fingerprint = $3, updated_at = $4
+             WHERE tenant_id = $5 AND idempotency_key = $6
+             RETURNING *`,
+            [lockedUntil, expiresAt, options.requestFingerprint, now, options.tenantId, options.key]
+          );
+          await client.query('COMMIT');
+          const record = this.mapRowToRecord(updateRes.rows[0]!);
           return {
-            status: 'IN_PROGRESS',
-            record: existing,
-            fencingToken: existing.fencingToken,
+            status: 'ACQUIRED',
+            record,
+            fencingToken: record.fencingToken,
           };
         }
 
-        // Lock expired: take over lease
-        const updateRes = await client.query<DBRecordRow>(
-          `UPDATE idempotency_records 
-           SET status = 'STARTED', fencing_token = fencing_token + 1,
-               locked_until = $1, expires_at = $2, updated_at = $3
-           WHERE tenant_id = $4 AND idempotency_key = $5
-           RETURNING *`,
-          [lockedUntil, expiresAt, now, options.tenantId, options.key]
-        );
-        await client.query('COMMIT');
-        const record = this.mapRowToRecord(updateRes.rows[0]!);
-        return {
-          status: 'ACQUIRED',
-          record,
-          fencingToken: record.fencingToken,
-        };
+        if (existing.status === 'FAILED') {
+          // Re-acquire on failed status
+          const updateRes = await client.query<DBRecordRow>(
+            `UPDATE idempotency_records 
+             SET status = 'STARTED', fencing_token = fencing_token + 1,
+                 locked_until = $1, expires_at = $2, request_fingerprint = $3, updated_at = $4
+             WHERE tenant_id = $5 AND idempotency_key = $6
+             RETURNING *`,
+            [lockedUntil, expiresAt, options.requestFingerprint, now, options.tenantId, options.key]
+          );
+          await client.query('COMMIT');
+          const record = this.mapRowToRecord(updateRes.rows[0]!);
+          return {
+            status: 'ACQUIRED',
+            record,
+            fencingToken: record.fencingToken,
+          };
+        }
       }
 
-      // FAILED state: allow retry
-      const updateRes = await client.query<DBRecordRow>(
-        `UPDATE idempotency_records 
-         SET request_fingerprint = $1, status = 'STARTED', fencing_token = fencing_token + 1,
-             locked_until = $2, expires_at = $3, updated_at = $4
-         WHERE tenant_id = $5 AND idempotency_key = $6
+      // Fresh key insert
+      const insertId = crypto.randomUUID();
+      const insertRes = await client.query<DBRecordRow>(
+        `INSERT INTO idempotency_records 
+         (id, tenant_id, idempotency_key, request_fingerprint, status, fencing_token, locked_until, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'STARTED', 1, $5, $6, $7, $7)
          RETURNING *`,
-        [options.requestFingerprint, lockedUntil, expiresAt, now, options.tenantId, options.key]
+        [insertId, options.tenantId, options.key, options.requestFingerprint, lockedUntil, expiresAt, now]
       );
+
       await client.query('COMMIT');
-      const record = this.mapRowToRecord(updateRes.rows[0]!);
+      const record = this.mapRowToRecord(insertRes.rows[0]!);
       return {
         status: 'ACQUIRED',
         record,
@@ -212,9 +217,7 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
       }
 
       const activeToken = BigInt(selectRes.rows[0]!.fencing_token);
-      if (options.fencingToken !== undefined && options.fencingToken < activeToken) {
-        throw new FencingTokenViolationError(options.key, activeToken, options.fencingToken);
-      }
+      FencingTokenGuard.assertValid(options.key, activeToken, options.fencingToken);
 
       await client.query(
         `UPDATE idempotency_records 
@@ -224,13 +227,14 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
              response_body = $3,
              locked_until = NULL,
              updated_at = NOW()
-         WHERE tenant_id = $4 AND idempotency_key = $5`,
+         WHERE tenant_id = $4 AND idempotency_key = $5 AND fencing_token <= $6`,
         [
           options.responseStatus,
           options.responseHeaders ? JSON.stringify(options.responseHeaders) : null,
           options.responseBody ? JSON.stringify(options.responseBody) : null,
           options.tenantId,
           options.key,
+          activeToken.toString(),
         ]
       );
 
@@ -246,14 +250,32 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
   public async abort(options: AbortOptions): Promise<void> {
     const client = await this.pool.connect();
     try {
-      await client.query(
-        `UPDATE idempotency_records 
-         SET status = 'FAILED',
-             locked_until = NULL,
-             updated_at = NOW()
-         WHERE tenant_id = $1 AND idempotency_key = $2`,
+      await client.query('BEGIN');
+
+      const selectRes = await client.query<DBRecordRow>(
+        `SELECT fencing_token FROM idempotency_records 
+         WHERE tenant_id = $1 AND idempotency_key = $2 FOR UPDATE`,
         [options.tenantId, options.key]
       );
+
+      if (selectRes.rows.length > 0) {
+        const activeToken = BigInt(selectRes.rows[0]!.fencing_token);
+        FencingTokenGuard.assertValid(options.key, activeToken, options.fencingToken);
+
+        await client.query(
+          `UPDATE idempotency_records 
+           SET status = 'FAILED',
+               locked_until = NULL,
+               updated_at = NOW()
+           WHERE tenant_id = $1 AND idempotency_key = $2 AND fencing_token <= $3`,
+          [options.tenantId, options.key, activeToken.toString()]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     } finally {
       client.release();
     }
@@ -285,16 +307,9 @@ export class PostgresStorageAdapter implements IIdempotencyStorage {
     return (res.rowCount ?? 0) > 0;
   }
 
-  public async sweepExpired(): Promise<number> {
-    const res = await this.pool.query(
-      `DELETE FROM idempotency_records WHERE expires_at <= NOW()`
-    );
-    return res.rowCount ?? 0;
-  }
-
   public async healthCheck(): Promise<boolean> {
     try {
-      const res = await this.pool.query('SELECT 1 as alive');
+      const res = await this.pool.query('SELECT 1 as healthy');
       return res.rows.length > 0;
     } catch {
       return false;
