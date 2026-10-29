@@ -1,6 +1,6 @@
 /**
  * Redis L2 Distributed Storage Adapter for DIKE
- * Coordinates distributed leases, TTLs, and cluster hash slot tagged records using ioredis.
+ * Coordinates distributed leases, TTLs, and cluster hash slot tagged records using ioredis and atomic Lua scripts.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -15,11 +15,12 @@ import {
   FencingTokenViolationError,
 } from '../core/types.js';
 import { RedisConnectionManager, RedisPoolConfig, formatClusterHashTag } from './redis_pool.js';
+import { executeAcquireLeaseLua } from './lua/lua_runner.js';
 
 interface RawSerializedRecord {
   readonly id: string;
-  readonly tenantId: string;
-  readonly key: string;
+  readonly tenantId?: string | undefined;
+  readonly key?: string | undefined;
   readonly requestFingerprint: string;
   readonly status: IdempotencyRecord['status'];
   readonly responseStatus?: number | undefined;
@@ -27,17 +28,18 @@ interface RawSerializedRecord {
   readonly responseBody?: unknown | undefined;
   readonly fencingToken?: string | undefined;
   readonly lockedUntil?: string | undefined;
-  readonly expiresAt: string;
+  readonly expiresAt?: string | undefined;
+  readonly expiresAtMs?: number | undefined;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
 
-function parseSerializedRecord(rawJson: string): IdempotencyRecord {
+function parseSerializedRecord(rawJson: string, tenantId = '', key = ''): IdempotencyRecord {
   const parsed = JSON.parse(rawJson) as RawSerializedRecord;
   return {
     id: parsed.id,
-    tenantId: parsed.tenantId,
-    key: parsed.key,
+    tenantId: parsed.tenantId || tenantId,
+    key: parsed.key || key,
     requestFingerprint: parsed.requestFingerprint,
     status: parsed.status,
     responseStatus: parsed.responseStatus,
@@ -45,7 +47,11 @@ function parseSerializedRecord(rawJson: string): IdempotencyRecord {
     responseBody: parsed.responseBody,
     fencingToken: parsed.fencingToken !== undefined ? BigInt(parsed.fencingToken) : undefined,
     lockedUntil: parsed.lockedUntil ? new Date(parsed.lockedUntil) : undefined,
-    expiresAt: new Date(parsed.expiresAt),
+    expiresAt: parsed.expiresAt
+      ? new Date(parsed.expiresAt)
+      : parsed.expiresAtMs
+      ? new Date(parsed.expiresAtMs)
+      : new Date(Date.now() + 86400000),
     createdAt: new Date(parsed.createdAt),
     updatedAt: new Date(parsed.updatedAt),
   };
@@ -68,70 +74,8 @@ export class RedisStorageAdapter implements IIdempotencyStorage {
 
   public async acquire(options: AcquireOptions): Promise<AcquireResult> {
     const client = await this.getActiveClient();
-    const redisKey = formatClusterHashTag(options.tenantId, options.key);
-    const now = Date.now();
-    const lockTimeout = options.lockTimeoutMs ?? 30_000;
-
-    // Retrieve active record
-    const existingRaw = await client.get(redisKey);
-
-    if (existingRaw) {
-      const existing = parseSerializedRecord(existingRaw);
-
-      if (existing.expiresAt.getTime() <= now) {
-        await client.del(redisKey);
-      } else if (existing.status === 'RESOLVED') {
-        if (existing.requestFingerprint !== options.requestFingerprint) {
-          return { status: 'PAYLOAD_MISMATCH', record: existing };
-        }
-        return { status: 'CACHED', record: existing };
-      } else if (existing.status === 'STARTED') {
-        const isLocked = existing.lockedUntil && existing.lockedUntil.getTime() > now;
-        if (isLocked) {
-          if (existing.requestFingerprint !== options.requestFingerprint) {
-            return { status: 'PAYLOAD_MISMATCH', record: existing };
-          }
-          return {
-            status: 'IN_PROGRESS',
-            record: existing,
-            fencingToken: existing.fencingToken,
-          };
-        }
-      }
-    }
-
-    // Allocate / take over lease with atomic fencing counter increment
-    const fencingKey = formatClusterHashTag(options.tenantId, options.key, 'fence');
-    const rawToken = await client.incr(fencingKey);
-    const fencingToken = BigInt(rawToken);
-
-    const record: IdempotencyRecord = {
-      id: crypto.randomUUID(),
-      tenantId: options.tenantId,
-      key: options.key,
-      requestFingerprint: options.requestFingerprint,
-      status: 'STARTED',
-      fencingToken,
-      lockedUntil: new Date(now + Math.min(options.ttlMs, lockTimeout)),
-      expiresAt: new Date(now + options.ttlMs),
-      createdAt: new Date(now),
-      updatedAt: new Date(now),
-    };
-
-    const serialized = JSON.stringify({
-      ...record,
-      fencingToken: fencingToken.toString(),
-    });
-
-    const ttlSeconds = Math.max(1, Math.ceil(options.ttlMs / 1000));
-    await client.set(redisKey, serialized, 'EX', ttlSeconds);
-    await client.expire(fencingKey, ttlSeconds);
-
-    return {
-      status: 'ACQUIRED',
-      record,
-      fencingToken,
-    };
+    // Execute atomic check-and-set via acquire_lease Lua script
+    return executeAcquireLeaseLua(client, options);
   }
 
   public async resolve(options: ResolveOptions): Promise<void> {
@@ -143,7 +87,7 @@ export class RedisStorageAdapter implements IIdempotencyStorage {
       throw new Error(`Cannot resolve non-existent idempotency record for key "${options.key}".`);
     }
 
-    const existing = parseSerializedRecord(existingRaw);
+    const existing = parseSerializedRecord(existingRaw, options.tenantId, options.key);
     const activeFencing = existing.fencingToken ?? 0n;
 
     if (options.fencingToken !== undefined && options.fencingToken < activeFencing) {
@@ -182,7 +126,7 @@ export class RedisStorageAdapter implements IIdempotencyStorage {
       return;
     }
 
-    const existing = parseSerializedRecord(existingRaw);
+    const existing = parseSerializedRecord(existingRaw, options.tenantId, options.key);
     const activeFencing = existing.fencingToken ?? 0n;
 
     if (options.fencingToken !== undefined && options.fencingToken < activeFencing) {
@@ -218,7 +162,7 @@ export class RedisStorageAdapter implements IIdempotencyStorage {
       return null;
     }
 
-    const record = parseSerializedRecord(raw);
+    const record = parseSerializedRecord(raw, tenantId, key);
 
     if (record.expiresAt.getTime() <= Date.now()) {
       await client.del(redisKey);
