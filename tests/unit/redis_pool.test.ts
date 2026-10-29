@@ -11,6 +11,7 @@ import {
   formatClusterHashTag,
 } from '../../src/storage/redis_pool.js';
 import { RedisStorageAdapter } from '../../src/storage/redis.js';
+import { ACQUIRE_LEASE_SHA } from '../../src/storage/lua/lua_runner.js';
 
 // Mock ioredis completely for isolated unit suite
 vi.mock('ioredis', () => {
@@ -47,6 +48,81 @@ vi.mock('ioredis', () => {
       const next = current + 1;
       this.fencingStore.set(key, next);
       return next;
+    });
+
+    public eval = vi.fn().mockImplementation(
+      async (
+        _script: string,
+        _numkeys: number,
+        recordKey: string,
+        fencingKey: string,
+        fingerprint: string,
+        ttlMsStr: string,
+        lockTimeoutMsStr: string,
+        currentTimeIso: string,
+        recordId: string,
+        nowMsStr: string
+      ) => {
+        const existingRaw = this.store.get(recordKey);
+        const nowMs = Number(nowMsStr);
+        const ttlMs = Number(ttlMsStr);
+        const lockTimeoutMs = Number(lockTimeoutMsStr);
+
+        if (existingRaw) {
+          const record = JSON.parse(existingRaw);
+          if (record.status === 'RESOLVED') {
+            if (record.requestFingerprint !== fingerprint) {
+              return JSON.stringify({ status: 'PAYLOAD_MISMATCH', record });
+            }
+            return JSON.stringify({ status: 'CACHED', record });
+          } else if (record.status === 'STARTED') {
+            let isLocked = true;
+            if (record.lockedUntilMs && record.lockedUntilMs <= nowMs) {
+              isLocked = false;
+            }
+            if (isLocked) {
+              if (record.requestFingerprint !== fingerprint) {
+                return JSON.stringify({ status: 'PAYLOAD_MISMATCH', record });
+              }
+              return JSON.stringify({
+                status: 'IN_PROGRESS',
+                record,
+                fencingToken: record.fencingToken,
+              });
+            }
+          }
+        }
+
+        const fence = (this.fencingStore.get(fencingKey) ?? 0) + 1;
+        this.fencingStore.set(fencingKey, fence);
+
+        const newRecord = {
+          id: recordId,
+          requestFingerprint: fingerprint,
+          status: 'STARTED',
+          fencingToken: String(fence),
+          lockedUntilMs: nowMs + Math.min(ttlMs, lockTimeoutMs),
+          lockedUntil: currentTimeIso,
+          expiresAtMs: nowMs + ttlMs,
+          createdAt: currentTimeIso,
+          updatedAt: currentTimeIso,
+        };
+
+        this.store.set(recordKey, JSON.stringify(newRecord));
+
+        return JSON.stringify({
+          status: 'ACQUIRED',
+          record: newRecord,
+          fencingToken: String(fence),
+        });
+      }
+    );
+
+    public evalsha = vi.fn().mockImplementation(async (sha: string, ...args: unknown[]) => {
+      if (sha === ACQUIRE_LEASE_SHA) {
+        return (this.eval as Function)('SCRIPT', ...args);
+      }
+      throw new Error('NOSCRIPT No matching script. Please use EVAL.');
     });
   }
 
