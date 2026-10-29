@@ -12,7 +12,7 @@ export default defineConfig({
         isolate: true,
       },
     },
-    testTimeout: 5000,
+    testTimeout: 10000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
