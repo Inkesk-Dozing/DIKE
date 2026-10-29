@@ -73,6 +73,11 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
 }
 
 /**
+ * Shared default logger instance for DIKE components.
+ */
+export const defaultLogger: Logger = createLogger();
+
+/**
  * Generates an RFC 4122 v4 UUID for request/trace correlation across distributed nodes.
  */
 export function generateTraceId(): string {
