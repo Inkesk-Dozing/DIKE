@@ -12,6 +12,8 @@ export * from './storage/interface.js';
 export * from './storage/memory.js';
 export * from './storage/memory_sweeper.js';
 export * from './storage/postgres.js';
+export * from './storage/redis_pool.js';
+export * from './storage/redis.js';
 export * from './db/migrator.js';
 export * from './server/config.js';
 export * from './server/app.js';
