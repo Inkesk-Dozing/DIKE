@@ -11,6 +11,7 @@ export * from './core/hasher.js';
 export * from './core/fencing.js';
 export * from './core/parking.js';
 export * from './core/lease_heartbeat.js';
+export * from './core/parking_timeout.js';
 export * from './storage/interface.js';
 export * from './storage/memory.js';
 export * from './storage/memory_sweeper.js';
