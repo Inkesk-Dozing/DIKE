@@ -12,11 +12,13 @@ import { IIdempotencyStorage } from '../storage/interface.js';
 import { MemoryStorageAdapter } from '../storage/memory.js';
 import { ietfHeadersPlugin } from './plugins/ietf_headers.js';
 import { idempotencyRoutes } from './routes/idempotency.js';
+import { socketDrain, DrainManager } from './drain.js';
 import { DEFAULT_REDACT_PATHS, generateTraceId, REDACTED_MASK } from '../utils/logger.js';
 
 export interface AppOptions {
   readonly config?: Partial<ServerConfig> | undefined;
   readonly storage?: IIdempotencyStorage | undefined;
+  readonly drainManager?: DrainManager | undefined;
 }
 
 export interface StorageHealthCapable {
@@ -27,11 +29,15 @@ declare module 'fastify' {
   interface FastifyRequest {
     traceId: string;
   }
+  interface FastifyInstance {
+    drainManager: DrainManager;
+  }
 }
 
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const config = { ...loadConfig(), ...(options.config ?? {}) };
   const storage = options.storage ?? new MemoryStorageAdapter();
+  const drainManager = options.drainManager ?? new DrainManager();
 
   const app: FastifyInstance = fastify({
     logger:
@@ -63,6 +69,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     req.traceId = req.id;
     reply.header('x-trace-id', req.id);
   });
+
+  // Rolling Zero-Downtime Socket Drainage Plugin
+  await app.register(socketDrain, { drainManager });
 
   // IETF Idempotency-Key Standard HTTP Header Compliance Plugin
   await app.register(ietfHeadersPlugin);
@@ -108,6 +117,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   // Kubernetes Probes: Readiness (/readyz)
   app.get('/readyz', async (_req: FastifyRequest, reply: FastifyReply) => {
+    // If pod is draining, fail readiness probe to instantly cut Ingress traffic
+    if (drainManager.isDraining()) {
+      return reply.status(503).send({
+        status: 'draining',
+        message: 'Pod is terminating and draining active connections.',
+        activeSockets: drainManager.getActiveSocketsCount(),
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     let isHealthy = true;
     const healthStorage = storage as StorageHealthCapable;
 
