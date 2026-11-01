@@ -1,7 +1,7 @@
 /**
  * Concurrent Execution Orchestrator & Fastify Gateway Helper
  * Coordinates end-to-end leader-follower mutation execution with connection parking,
- * ensuring exactly-once execution of business logic across concurrent threads.
+ * error classification, and lease eviction, ensuring exactly-once execution across concurrent threads.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -10,6 +10,7 @@ import { IIdempotencyStorage } from '../storage/interface.js';
 import { ConnectionParkingLot, ParkedResponsePayload } from './parking.js';
 import { BoundedParkingHandler } from './parking_timeout.js';
 import { AdaptiveBackpressureController, defaultBackpressureController } from './backpressure.js';
+import { ErrorStatusClassifier, defaultErrorClassifier } from './error_classifier.js';
 import { computeStaticFingerprint } from './hasher.js';
 import { defaultLogger } from '../utils/logger.js';
 
@@ -19,6 +20,7 @@ export interface ExecuteIdempotentOptions<T = unknown> {
   readonly storage: IIdempotencyStorage;
   readonly parkingLot: ConnectionParkingLot;
   readonly backpressure?: AdaptiveBackpressureController | undefined;
+  readonly errorClassifier?: ErrorStatusClassifier | undefined;
   readonly ttlMs?: number | undefined;
   readonly lockTimeoutMs?: number | undefined;
   readonly parkingTimeoutMs?: number | undefined;
@@ -42,7 +44,7 @@ export interface IdempotentExecutionResult<T = unknown> {
 /**
  * Executes a mutation with guaranteed exactly-once idempotency semantics,
  * leader election via atomic lease acquisition, follower connection parking,
- * and adaptive backpressure.
+ * error classification, and adaptive backpressure.
  */
 export async function executeIdempotentMutation<T = unknown>(
   options: ExecuteIdempotentOptions<T>
@@ -53,6 +55,7 @@ export async function executeIdempotentMutation<T = unknown>(
     storage,
     parkingLot,
     backpressure = defaultBackpressureController,
+    errorClassifier = defaultErrorClassifier,
     ttlMs = 86_400_000,
     lockTimeoutMs = 30_000,
     parkingTimeoutMs = 15_000,
@@ -80,23 +83,45 @@ export async function executeIdempotentMutation<T = unknown>(
     try {
       // Execute the upstream mutation
       const actionResult = await action();
+      const decision = errorClassifier.classifyStatus(actionResult.statusCode);
 
-      // Resolve and commit into storage
-      await storage.resolve({
+      if (decision.isCacheable) {
+        // Resolve and commit permanent response into storage
+        await storage.resolve({
+          tenantId,
+          key,
+          responseStatus: actionResult.statusCode,
+          responseHeaders: actionResult.headers,
+          responseBody: actionResult.body,
+          fencingToken,
+        });
+
+        // Broadcast resolution to all parked followers on this key
+        parkingLot.broadcast(tenantId, key, {
+          statusCode: actionResult.statusCode,
+          headers: actionResult.headers,
+          body: actionResult.body,
+        });
+
+        return {
+          role: 'LEADER',
+          statusCode: actionResult.statusCode,
+          headers: actionResult.headers,
+          body: actionResult.body,
+          idempotencyStatus: 'MISS',
+        };
+      }
+
+      // Transient failure status returned by upstream (e.g. 500, 502, 503, 504)
+      const errorReason = `Upstream returned transient failure status ${actionResult.statusCode}`;
+      await storage.abort({
         tenantId,
         key,
-        responseStatus: actionResult.statusCode,
-        responseHeaders: actionResult.headers,
-        responseBody: actionResult.body,
+        errorReason,
         fencingToken,
       });
 
-      // Broadcast resolution to all parked followers on this key
-      parkingLot.broadcast(tenantId, key, {
-        statusCode: actionResult.statusCode,
-        headers: actionResult.headers,
-        body: actionResult.body,
-      });
+      parkingLot.abort(tenantId, key, errorReason);
 
       return {
         role: 'LEADER',
@@ -106,7 +131,7 @@ export async function executeIdempotentMutation<T = unknown>(
         idempotencyStatus: 'MISS',
       };
     } catch (err: any) {
-      // Upstream failed: abort lease and broadcast failure to followers
+      // Upstream failed with exception: abort lease and broadcast failure to followers
       const errorReason = err?.message || 'Upstream execution failed';
       await storage.abort({
         tenantId,
