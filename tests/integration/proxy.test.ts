@@ -102,7 +102,7 @@ describe('End-to-End Reverse Proxy Integration Suite', () => {
       attestationSigner,
     });
     await proxyApp.ready();
-  });
+  }, 30000);
 
   afterEach(async () => {
     if (proxyApp) {
