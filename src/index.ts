@@ -35,6 +35,7 @@ export * from './proxy/upstream.js';
 export * from './proxy/interceptor.js';
 export * from './proxy/stream_tee.js';
 export * from './proxy/header_filter.js';
+export * from './proxy/etag_handler.js';
 export * from './proxy/handler.js';
 export * from './security/attest.js';
 export * from './utils/logger.js';
