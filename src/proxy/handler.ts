@@ -8,10 +8,10 @@
 import { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import fp from 'fastify-plugin';
 import { UpstreamDispatcher, UpstreamConfig } from './upstream.js';
+import { IdempotencyInterceptor, InterceptorOptions } from './interceptor.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { ConnectionParkingLot } from '../core/parking.js';
 import { executeIdempotentMutation } from '../core/orchestrator.js';
-import { IETF_IDEMPOTENCY_KEY_HEADER } from '../server/plugins/ietf_headers.js';
 
 export interface ReverseProxyPluginOptions {
   /**
@@ -31,6 +31,10 @@ export interface ReverseProxyPluginOptions {
    */
   readonly prefix?: string | undefined;
   /**
+   * Interceptor options (strictMode, custom mutation methods, excluded paths).
+   */
+  readonly interceptorOptions?: InterceptorOptions | undefined;
+  /**
    * Paths excluded from reverse proxying (e.g. /healthz, /readyz, /v1/idempotency).
    */
   readonly excludedPaths?: string[] | undefined;
@@ -39,6 +43,7 @@ export interface ReverseProxyPluginOptions {
 declare module 'fastify' {
   interface FastifyInstance {
     upstreamDispatcher: UpstreamDispatcher;
+    idempotencyInterceptor: IdempotencyInterceptor;
   }
 }
 
@@ -49,34 +54,39 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
   const dispatcher = new UpstreamDispatcher(opts.upstream);
   app.decorate('upstreamDispatcher', dispatcher);
 
+  const interceptor = new IdempotencyInterceptor({
+    ...opts.interceptorOptions,
+    excludedPaths: [
+      ...(opts.excludedPaths ?? []),
+      ...(opts.interceptorOptions?.excludedPaths ?? []),
+    ],
+  });
+  app.decorate('idempotencyInterceptor', interceptor);
+
   const storage = opts.storage ?? (app as any).storage;
   const parkingLot = opts.parkingLot ?? (app as any).parkingLot ?? new ConnectionParkingLot();
-
-  const excludedPaths = new Set([
-    '/healthz',
-    '/readyz',
-    '/drain',
-    '/v1/idempotency/begin',
-    '/v1/idempotency/resolve',
-    '/v1/idempotency/abort',
-    ...(opts.excludedPaths ?? []),
-  ]);
 
   /**
    * Universal catch-all reverse proxy route handler
    */
   app.all('/*', async (req: FastifyRequest, reply: FastifyReply) => {
-    // If request matches an internal management endpoint, skip proxying
-    const pathname = (req.url || '/').split('?')[0] ?? '/';
-    if (excludedPaths.has(pathname)) {
-      return;
+    const decision = interceptor.evaluate(req, Boolean(storage));
+
+    // 1. Rejection (e.g. Strict Mode violation)
+    if (decision.action === 'REJECT') {
+      return reply.status(decision.statusCode).send({
+        error: 'Bad Request',
+        message: decision.message,
+      });
     }
 
-    const rawKey = req.headers[IETF_IDEMPOTENCY_KEY_HEADER];
-    const isMutation = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
+    // 2. Direct Pass-through: Non-mutation, missing key without strict mode, or excluded paths
+    if (decision.action === 'BYPASS') {
+      // If it's an internal excluded path, do not forward to upstream
+      if (decision.reason === 'EXCLUDED_PATH') {
+        return;
+      }
 
-    // 1. Transparent Pass-through: Non-mutation OR mutation without Idempotency-Key
-    if (!isMutation || !rawKey || !storage) {
       const upstreamRes = await dispatcher.forward(req);
 
       // Replay headers onto FastifyReply
@@ -88,9 +98,8 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
       return reply.status(upstreamRes.statusCode).send(upstreamRes.body);
     }
 
-    // 2. Idempotent Interception: Mutation with Idempotency-Key header present
-    const idempotencyKey = Array.isArray(rawKey) ? (rawKey[0] ?? '').trim() : String(rawKey).trim();
-    const tenantId = (req.headers['x-client-id'] as string) || (req.headers['x-tenant-id'] as string) || 'default_tenant';
+    // 3. Idempotent Interception: Mutation with valid Idempotency-Key
+    const { key: idempotencyKey, tenantId } = decision;
 
     const executionResult = await executeIdempotentMutation({
       tenantId,

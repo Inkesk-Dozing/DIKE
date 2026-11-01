@@ -30,5 +30,6 @@ export * from './server/drain.js';
 export * from './server/routes/idempotency.js';
 export * from './server/plugins/ietf_headers.js';
 export * from './proxy/upstream.js';
+export * from './proxy/interceptor.js';
 export * from './proxy/handler.js';
 export * from './utils/logger.js';
