@@ -1,7 +1,8 @@
 /**
  * Fastify Transparent Reverse Proxy Plugin Architecture for DIKE
  * Attaches transparent reverse proxy forwarding with automatic header propagation,
- * selective idempotency interception, and sub-millisecond proxy pipeline overhead.
+ * selective idempotency interception, cryptographic attestation receipt signing,
+ * and sub-millisecond proxy pipeline overhead.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -10,6 +11,7 @@ import fp from 'fastify-plugin';
 import { UpstreamDispatcher, UpstreamConfig } from './upstream.js';
 import { IdempotencyInterceptor, InterceptorOptions } from './interceptor.js';
 import { ResponseHeaderFilter, HeaderFilterOptions } from './header_filter.js';
+import { AttestationReceiptSigner, ATTESTATION_HEADER_NAME } from '../security/attest.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { ConnectionParkingLot } from '../core/parking.js';
 import { executeIdempotentMutation } from '../core/orchestrator.js';
@@ -27,6 +29,10 @@ export interface ReverseProxyPluginOptions {
    * Reference to ConnectionParkingLot multiplexer.
    */
   readonly parkingLot?: ConnectionParkingLot | undefined;
+  /**
+   * Optional cryptographic attestation signer.
+   */
+  readonly attestationSigner?: AttestationReceiptSigner | undefined;
   /**
    * Route prefix for reverse proxy endpoints. Defaults to '/' (all non-management routes).
    */
@@ -50,6 +56,7 @@ declare module 'fastify' {
     upstreamDispatcher: UpstreamDispatcher;
     idempotencyInterceptor: IdempotencyInterceptor;
     responseHeaderFilter: ResponseHeaderFilter;
+    attestationSigner?: AttestationReceiptSigner | undefined;
   }
 }
 
@@ -71,6 +78,11 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
 
   const headerFilter = new ResponseHeaderFilter(opts.headerFilterOptions);
   app.decorate('responseHeaderFilter', headerFilter);
+
+  const attestationSigner = opts.attestationSigner ?? (app as any).attestationSigner;
+  if (attestationSigner) {
+    app.decorate('attestationSigner', attestationSigner);
+  }
 
   const storage = opts.storage ?? (app as any).storage;
   const parkingLot = opts.parkingLot ?? (app as any).parkingLot ?? new ConnectionParkingLot();
@@ -152,6 +164,17 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
         if (k.toLowerCase() === 'content-length' || k.toLowerCase() === 'transfer-encoding') continue;
         reply.header(k, v);
       }
+    }
+
+    // If attestation signer is configured and this is a replayed cache hit, attach cryptographic receipt
+    if (attestationSigner && executionResult.idempotencyStatus === 'HIT') {
+      const receipt = attestationSigner.sign({
+        tenantId,
+        key: idempotencyKey,
+        fingerprint: (executionResult as any).fingerprint ?? '',
+        statusCode: executionResult.statusCode,
+      });
+      reply.header(ATTESTATION_HEADER_NAME, receipt.headerValue);
     }
 
     return reply.status(executionResult.statusCode).send(executionResult.body);
