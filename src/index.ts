@@ -23,6 +23,7 @@ export * from './storage/redis_pool.js';
 export * from './storage/redis.js';
 export * from './storage/pubsub.js';
 export * from './storage/fallback.js';
+export * from './storage/blob_storage.js';
 export * from './storage/lua/lua_runner.js';
 export * from './db/migrator.js';
 export * from './server/config.js';
