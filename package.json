@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "benchmark:k6": "k6 run load-tests/k6-concurrency.js",
     "lint": "eslint src/ --ext .ts"
   },
   "keywords": [
@@ -49,6 +50,6 @@
     "eslint": "^9.20.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
-    "vitest": "^5.0.5"
+    "vitest": "^3.2.4"
   }
 }
