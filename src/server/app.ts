@@ -1,6 +1,6 @@
 /**
  * Fastify Server Pipeline & Application Factory
- * Configures HTTP routing, security middleware, probes, and structured error boundaries.
+ * Configures HTTP routing, security middleware, Prometheus metrics endpoint, probes, and structured error boundaries.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -15,6 +15,8 @@ import { idempotencyRoutes } from './routes/idempotency.js';
 import { attestVerifyRoutes } from './routes/attest.js';
 import { socketDrain, DrainManager } from './drain.js';
 import { AttestationReceiptSigner } from '../security/attest.js';
+import { PrometheusRegistry, defaultMetricsRegistry } from '../telemetry/metrics.js';
+import { DistributedTracer, defaultDistributedTracer, W3C_TRACEPARENT_HEADER } from '../telemetry/tracing.js';
 import { DEFAULT_REDACT_PATHS, generateTraceId, REDACTED_MASK } from '../utils/logger.js';
 
 export interface AppOptions {
@@ -22,6 +24,8 @@ export interface AppOptions {
   readonly storage?: IIdempotencyStorage | undefined;
   readonly drainManager?: DrainManager | undefined;
   readonly attestationSigner?: AttestationReceiptSigner | undefined;
+  readonly metricsRegistry?: PrometheusRegistry | undefined;
+  readonly tracer?: DistributedTracer | undefined;
 }
 
 export interface StorageHealthCapable {
@@ -31,10 +35,13 @@ export interface StorageHealthCapable {
 declare module 'fastify' {
   interface FastifyRequest {
     traceId: string;
+    traceContext?: ReturnType<DistributedTracer['extractContext']>;
   }
   interface FastifyInstance {
     drainManager: DrainManager;
     attestationSigner?: AttestationReceiptSigner | undefined;
+    metricsRegistry: PrometheusRegistry;
+    tracer: DistributedTracer;
   }
 }
 
@@ -42,6 +49,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const config = { ...loadConfig(), ...(options.config ?? {}) };
   const storage = options.storage ?? new MemoryStorageAdapter();
   const drainManager = options.drainManager ?? new DrainManager();
+  const metricsRegistry = options.metricsRegistry ?? defaultMetricsRegistry;
+  const tracer = options.tracer ?? defaultDistributedTracer;
 
   const app: FastifyInstance = fastify({
     logger:
@@ -59,12 +68,40 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     keepAliveTimeout: 5_000,
   });
 
-  // Attach Trace ID Correlation Hook
+  // Attach Trace ID & W3C Traceparent Correlation Hook
   app.addHook('onRequest', async (req: FastifyRequest, reply: FastifyReply) => {
-    const traceIdHeader = req.headers['x-trace-id'];
-    const traceId = (Array.isArray(traceIdHeader) ? traceIdHeader[0] : traceIdHeader) || generateTraceId();
-    req.traceId = traceId;
-    reply.header('x-trace-id', traceId);
+    const rawTraceIdHeader = req.headers['x-trace-id'];
+    const customTraceId = Array.isArray(rawTraceIdHeader) ? rawTraceIdHeader[0] : rawTraceIdHeader;
+
+    const traceCtx = tracer.extractContext(req);
+    req.traceContext = traceCtx;
+
+    // If client supplied explicit x-trace-id, prioritize it.
+    // Otherwise, if client provided W3C traceparent, synchronize x-trace-id to traceparent traceId.
+    // If neither was provided, default to RFC 4122 v4 UUID.
+    const hasExplicitTraceparent = Boolean(req.headers[W3C_TRACEPARENT_HEADER]);
+    const activeTraceId = customTraceId || (hasExplicitTraceparent ? traceCtx.traceId : generateTraceId());
+    req.traceId = activeTraceId;
+
+    reply.header('x-trace-id', activeTraceId);
+    reply.header(W3C_TRACEPARENT_HEADER, `${traceCtx.version}-${traceCtx.traceId}-${traceCtx.spanId}-${traceCtx.traceFlags}`);
+  });
+
+  // Prometheus Metrics onResponse Hook
+  app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
+    const idempotencyStatus = (reply.getHeader('idempotency-status') as string) || 'NONE';
+    metricsRegistry.requestsTotal.inc({
+      method: req.method,
+      status: reply.statusCode,
+      idempotency: idempotencyStatus,
+    });
+
+    const tenant = (req.headers['x-client-id'] as string) || (req.headers['x-tenant-id'] as string) || 'default_tenant';
+    if (idempotencyStatus === 'HIT') {
+      metricsRegistry.cacheHitsTotal.inc({ tenant });
+    } else if (idempotencyStatus === 'MISS') {
+      metricsRegistry.cacheMissesTotal.inc({ tenant });
+    }
   });
 
   // Core Security Plugins
@@ -75,8 +112,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await app.register(cors, {
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Client-Id', 'X-Tenant-Id', 'X-Trace-Id'],
-    exposedHeaders: ['Idempotency-Key', 'Idempotency-Status', 'X-Trace-Id', 'X-DIKE-Attestation'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Client-Id', 'X-Tenant-Id', 'X-Trace-Id', 'traceparent', 'tracestate'],
+    exposedHeaders: ['Idempotency-Key', 'Idempotency-Status', 'X-Trace-Id', 'traceparent', 'X-DIKE-Attestation'],
   });
 
   // Zero-Downtime Socket Drainage Engine
@@ -90,6 +127,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Decorators
   app.decorate('config', config);
   app.decorate('storage', storage);
+  app.decorate('metricsRegistry', metricsRegistry);
+  app.decorate('tracer', tracer);
   if (options.attestationSigner) {
     app.decorate('attestationSigner', options.attestationSigner);
   }
@@ -98,6 +137,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await app.register(idempotencyRoutes);
   await app.register(attestVerifyRoutes, {
     attestationSigner: options.attestationSigner,
+  });
+
+  // Prometheus Metrics Endpoint (/metrics)
+  app.get('/metrics', async (_req: FastifyRequest, reply: FastifyReply) => {
+    const rendered = metricsRegistry.renderMetrics();
+    return reply
+      .header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+      .status(200)
+      .send(rendered);
   });
 
   // Standardized Error Handler

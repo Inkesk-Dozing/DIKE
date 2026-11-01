@@ -26,6 +26,8 @@ export * from './storage/fallback.js';
 export * from './storage/blob_storage.js';
 export * from './storage/lua/lua_runner.js';
 export * from './db/migrator.js';
+export * from './telemetry/metrics.js';
+export * from './telemetry/tracing.js';
 export * from './server/config.js';
 export * from './server/app.js';
 export * from './server/drain.js';
