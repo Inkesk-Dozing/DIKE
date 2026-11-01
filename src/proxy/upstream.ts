@@ -1,26 +1,25 @@
 /**
- * Upstream Target Dispatcher for DIKE Transparent Reverse Proxy
- * Executes non-blocking streaming HTTP forward calls to upstream backend targets
- * using native Node.js global fetch and streams, preserving client headers,
- * cookies, verbs, and propagating X-Forwarded headers.
+ * Upstream Request Dispatcher and Connection Forwarder for DIKE
+ * Transparently relays client requests to backend services with sub-millisecond overhead,
+ * preserving original HTTP methods, headers, cookies, and injecting W3C traceparents.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
 import { FastifyRequest } from 'fastify';
 import { defaultLogger } from '../utils/logger.js';
+import { defaultDistributedTracer, W3C_TRACEPARENT_HEADER, W3C_TRACESTATE_HEADER } from '../telemetry/tracing.js';
 
 export interface UpstreamConfig {
   /**
-   * Base target URL of the upstream server (e.g., http://localhost:8081).
+   * Upstream backend target URL base (e.g. 'http://backend.internal:8080').
    */
   readonly targetUrl: string;
   /**
-   * Timeout in milliseconds for upstream requests.
-   * Defaults to 30,000 ms (30 seconds).
+   * Request timeout in milliseconds. Defaults to 30,000ms.
    */
   readonly timeoutMs?: number | undefined;
   /**
-   * Additional custom headers injected onto all upstream requests.
+   * Custom request headers to append to all forwarded requests.
    */
   readonly customHeaders?: Record<string, string> | undefined;
 }
@@ -33,15 +32,14 @@ export interface UpstreamResponse {
 }
 
 export class UpstreamDispatcher {
-  public readonly targetUrl: string;
-  public readonly timeoutMs: number;
-  public readonly customHeaders: Record<string, string>;
+  private readonly targetUrl: string;
+  private readonly timeoutMs: number;
+  private readonly customHeaders: Record<string, string>;
 
   constructor(config: UpstreamConfig) {
     if (!config.targetUrl) {
-      throw new Error('UpstreamDispatcher requires a non-empty targetUrl.');
+      throw new Error('UpstreamDispatcher requires a valid targetUrl.');
     }
-    // Remove trailing slash if present
     this.targetUrl = config.targetUrl.replace(/\/+$/, '');
     this.timeoutMs = config.timeoutMs ?? 30_000;
     this.customHeaders = config.customHeaders ?? {};
@@ -49,7 +47,7 @@ export class UpstreamDispatcher {
 
   /**
    * Normalizes inbound Fastify headers into forwarded request headers:
-   * preserves cookies, authorization, host, and appends X-Forwarded-For & X-Forwarded-Proto.
+   * preserves cookies, authorization, host, appends X-Forwarded-*, and injects W3C traceparent.
    */
   public prepareForwardHeaders(req: FastifyRequest): Record<string, string> {
     const forwardHeaders: Record<string, string> = { ...this.customHeaders };
@@ -85,8 +83,10 @@ export class UpstreamDispatcher {
     forwardHeaders['x-forwarded-host'] =
       (req.headers['x-forwarded-host'] as string) || (req.headers.host ?? 'localhost');
 
-    // Ensure trace ID correlation is forwarded
-    if (req.traceId) {
+    // Ensure trace ID correlation and W3C traceparent are propagated
+    if (req.traceContext) {
+      Object.assign(forwardHeaders, defaultDistributedTracer.injectHeaders(req.traceContext));
+    } else if (req.traceId) {
       forwardHeaders['x-trace-id'] = req.traceId;
     }
 
