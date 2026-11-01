@@ -38,3 +38,7 @@ Thumbs.db
 # Temporary / Scratch
 scratch/
 *.log
+
+# Rust / Cargo artifacts
+plugins/**/target/
+Cargo.lock
