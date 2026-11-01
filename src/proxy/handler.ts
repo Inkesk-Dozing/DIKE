@@ -2,7 +2,7 @@
  * Fastify Transparent Reverse Proxy Plugin Architecture for DIKE
  * Attaches transparent reverse proxy forwarding with automatic header propagation,
  * selective idempotency interception, cryptographic attestation receipt signing,
- * and sub-millisecond proxy pipeline overhead.
+ * ETag/304 conditional validation handling, and sub-millisecond proxy pipeline overhead.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -11,6 +11,7 @@ import fp from 'fastify-plugin';
 import { UpstreamDispatcher, UpstreamConfig } from './upstream.js';
 import { IdempotencyInterceptor, InterceptorOptions } from './interceptor.js';
 import { ResponseHeaderFilter, HeaderFilterOptions } from './header_filter.js';
+import { ETagCoexistenceHandler, defaultETagHandler } from './etag_handler.js';
 import { AttestationReceiptSigner, ATTESTATION_HEADER_NAME } from '../security/attest.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { ConnectionParkingLot } from '../core/parking.js';
@@ -34,6 +35,10 @@ export interface ReverseProxyPluginOptions {
    */
   readonly attestationSigner?: AttestationReceiptSigner | undefined;
   /**
+   * Optional ETag coexistence handler.
+   */
+  readonly etagHandler?: ETagCoexistenceHandler | undefined;
+  /**
    * Route prefix for reverse proxy endpoints. Defaults to '/' (all non-management routes).
    */
   readonly prefix?: string | undefined;
@@ -56,6 +61,7 @@ declare module 'fastify' {
     upstreamDispatcher: UpstreamDispatcher;
     idempotencyInterceptor: IdempotencyInterceptor;
     responseHeaderFilter: ResponseHeaderFilter;
+    etagHandler: ETagCoexistenceHandler;
     attestationSigner?: AttestationReceiptSigner | undefined;
   }
 }
@@ -78,6 +84,9 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
 
   const headerFilter = new ResponseHeaderFilter(opts.headerFilterOptions);
   app.decorate('responseHeaderFilter', headerFilter);
+
+  const etagHandler = opts.etagHandler ?? defaultETagHandler;
+  app.decorate('etagHandler', etagHandler);
 
   const attestationSigner = opts.attestationSigner ?? (app as any).attestationSigner;
   if (attestationSigner) {
@@ -142,10 +151,23 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
 
         const sanitizedHeaders = headerFilter.sanitizeForStorage(upstreamRes.headers);
 
+        // Fetch existing record if upstream returned 304 to preserve existing body
+        let existingRecord = null;
+        if (upstreamRes.statusCode === 304 && storage) {
+          existingRecord = await storage.get(tenantId, idempotencyKey);
+        }
+
+        const etagEval = etagHandler.evaluateResponse(
+          upstreamRes.statusCode,
+          sanitizedHeaders,
+          parsedBody,
+          existingRecord
+        );
+
         return {
-          statusCode: upstreamRes.statusCode,
-          headers: sanitizedHeaders,
-          body: parsedBody,
+          statusCode: etagEval.statusCode,
+          headers: etagEval.headers,
+          body: etagEval.bodyToPersist,
         };
       },
     });
@@ -163,6 +185,28 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
       for (const [k, v] of Object.entries(outHeaders)) {
         if (k.toLowerCase() === 'content-length' || k.toLowerCase() === 'transfer-encoding') continue;
         reply.header(k, v);
+      }
+    }
+
+    // If client sent If-None-Match matching cached ETag on replay, return 304
+    if (executionResult.idempotencyStatus === 'HIT' && executionResult.headers) {
+      const now = new Date();
+      const conditionalCheck = etagHandler.evaluateReplayConditional(req, {
+        id: `${tenantId}:${idempotencyKey}`,
+        tenantId,
+        key: idempotencyKey,
+        requestFingerprint: '',
+        status: 'RESOLVED',
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: new Date(now.getTime() + 86400000),
+        responseStatus: executionResult.statusCode,
+        responseHeaders: executionResult.headers,
+        responseBody: executionResult.body,
+      });
+
+      if (conditionalCheck.shouldSend304) {
+        return reply.status(304).send();
       }
     }
 
