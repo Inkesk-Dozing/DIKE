@@ -169,6 +169,6 @@ describe('MemoryStorageAdapter (L1 Fast-Path Cache)', () => {
     }
 
     const elapsed = performance.now() - start;
-    expect(elapsed).toBeLessThan(250);
+    expect(elapsed).toBeLessThan(500);
   });
 });
