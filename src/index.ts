@@ -32,5 +32,6 @@ export * from './server/plugins/ietf_headers.js';
 export * from './proxy/upstream.js';
 export * from './proxy/interceptor.js';
 export * from './proxy/stream_tee.js';
+export * from './proxy/header_filter.js';
 export * from './proxy/handler.js';
 export * from './utils/logger.js';
