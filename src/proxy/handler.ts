@@ -9,6 +9,7 @@ import { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } fro
 import fp from 'fastify-plugin';
 import { UpstreamDispatcher, UpstreamConfig } from './upstream.js';
 import { IdempotencyInterceptor, InterceptorOptions } from './interceptor.js';
+import { ResponseHeaderFilter, HeaderFilterOptions } from './header_filter.js';
 import { IIdempotencyStorage } from '../storage/interface.js';
 import { ConnectionParkingLot } from '../core/parking.js';
 import { executeIdempotentMutation } from '../core/orchestrator.js';
@@ -35,6 +36,10 @@ export interface ReverseProxyPluginOptions {
    */
   readonly interceptorOptions?: InterceptorOptions | undefined;
   /**
+   * Header filtering options (hop-by-hop stripping, fresh date injection).
+   */
+  readonly headerFilterOptions?: HeaderFilterOptions | undefined;
+  /**
    * Paths excluded from reverse proxying (e.g. /healthz, /readyz, /v1/idempotency).
    */
   readonly excludedPaths?: string[] | undefined;
@@ -44,6 +49,7 @@ declare module 'fastify' {
   interface FastifyInstance {
     upstreamDispatcher: UpstreamDispatcher;
     idempotencyInterceptor: IdempotencyInterceptor;
+    responseHeaderFilter: ResponseHeaderFilter;
   }
 }
 
@@ -62,6 +68,9 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
     ],
   });
   app.decorate('idempotencyInterceptor', interceptor);
+
+  const headerFilter = new ResponseHeaderFilter(opts.headerFilterOptions);
+  app.decorate('responseHeaderFilter', headerFilter);
 
   const storage = opts.storage ?? (app as any).storage;
   const parkingLot = opts.parkingLot ?? (app as any).parkingLot ?? new ConnectionParkingLot();
@@ -88,9 +97,10 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
       }
 
       const upstreamRes = await dispatcher.forward(req);
+      const sanitizedHeaders = headerFilter.sanitizeForStorage(upstreamRes.headers);
 
       // Replay headers onto FastifyReply
-      for (const [k, v] of Object.entries(upstreamRes.headers)) {
+      for (const [k, v] of Object.entries(sanitizedHeaders)) {
         if (k === 'content-length' || k === 'transfer-encoding') continue;
         reply.header(k, v);
       }
@@ -118,9 +128,11 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
           parsedBody = upstreamRes.body.toString('utf-8');
         }
 
+        const sanitizedHeaders = headerFilter.sanitizeForStorage(upstreamRes.headers);
+
         return {
           statusCode: upstreamRes.statusCode,
-          headers: upstreamRes.headers,
+          headers: sanitizedHeaders,
           body: parsedBody,
         };
       },
@@ -131,7 +143,12 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
     }
 
     if (executionResult.headers) {
-      for (const [k, v] of Object.entries(executionResult.headers)) {
+      const isReplay = executionResult.idempotencyStatus === 'HIT';
+      const outHeaders = isReplay
+        ? headerFilter.prepareReplayHeaders(executionResult.headers)
+        : executionResult.headers;
+
+      for (const [k, v] of Object.entries(outHeaders)) {
         if (k.toLowerCase() === 'content-length' || k.toLowerCase() === 'transfer-encoding') continue;
         reply.header(k, v);
       }
