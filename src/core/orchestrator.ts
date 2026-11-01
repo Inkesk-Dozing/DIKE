@@ -1,7 +1,7 @@
 /**
  * Concurrent Execution Orchestrator & Fastify Gateway Helper
  * Coordinates end-to-end leader-follower mutation execution with connection parking,
- * error classification, and lease eviction, ensuring exactly-once execution across concurrent threads.
+ * error classification, large blob object offloading, and lease eviction, ensuring exactly-once execution.
  * Proprietary Software - (c) 2026 Kushagra Bhardwaj & Mrinal Prakash
  */
 
@@ -11,6 +11,7 @@ import { ConnectionParkingLot, ParkedResponsePayload } from './parking.js';
 import { BoundedParkingHandler } from './parking_timeout.js';
 import { AdaptiveBackpressureController, defaultBackpressureController } from './backpressure.js';
 import { ErrorStatusClassifier, defaultErrorClassifier } from './error_classifier.js';
+import { S3BlobStorageAdapter } from '../storage/blob_storage.js';
 import { computeStaticFingerprint } from './hasher.js';
 import { defaultLogger } from '../utils/logger.js';
 
@@ -21,6 +22,7 @@ export interface ExecuteIdempotentOptions<T = unknown> {
   readonly parkingLot: ConnectionParkingLot;
   readonly backpressure?: AdaptiveBackpressureController | undefined;
   readonly errorClassifier?: ErrorStatusClassifier | undefined;
+  readonly blobStorage?: S3BlobStorageAdapter | undefined;
   readonly ttlMs?: number | undefined;
   readonly lockTimeoutMs?: number | undefined;
   readonly parkingTimeoutMs?: number | undefined;
@@ -44,7 +46,7 @@ export interface IdempotentExecutionResult<T = unknown> {
 /**
  * Executes a mutation with guaranteed exactly-once idempotency semantics,
  * leader election via atomic lease acquisition, follower connection parking,
- * error classification, and adaptive backpressure.
+ * blob offloading, error classification, and adaptive backpressure.
  */
 export async function executeIdempotentMutation<T = unknown>(
   options: ExecuteIdempotentOptions<T>
@@ -56,6 +58,7 @@ export async function executeIdempotentMutation<T = unknown>(
     parkingLot,
     backpressure = defaultBackpressureController,
     errorClassifier = defaultErrorClassifier,
+    blobStorage,
     ttlMs = 86_400_000,
     lockTimeoutMs = 30_000,
     parkingTimeoutMs = 15_000,
@@ -86,13 +89,27 @@ export async function executeIdempotentMutation<T = unknown>(
       const decision = errorClassifier.classifyStatus(actionResult.statusCode);
 
       if (decision.isCacheable) {
-        // Resolve and commit permanent response into storage
+        // Evaluate if body exceeds blob threshold and needs S3 offloading
+        let bodyToPersist: unknown = actionResult.body;
+        if (blobStorage) {
+          const offloadRes = await blobStorage.storeIfLarge(
+            tenantId,
+            key,
+            actionResult.body,
+            actionResult.headers?.['content-type']
+          );
+          if (offloadRes.offloaded) {
+            bodyToPersist = { s3Uri: offloadRes.s3Uri, metadata: offloadRes.metadata };
+          }
+        }
+
+        // Resolve and commit into storage
         await storage.resolve({
           tenantId,
           key,
           responseStatus: actionResult.statusCode,
           responseHeaders: actionResult.headers,
-          responseBody: actionResult.body,
+          responseBody: bodyToPersist,
           fencingToken,
         });
 
@@ -147,11 +164,16 @@ export async function executeIdempotentMutation<T = unknown>(
 
   // 3. Case B: CACHED -> Immediate cached replay
   if (acquireResult.status === 'CACHED' && acquireResult.record) {
+    let replayedBody = acquireResult.record.responseBody;
+    if (blobStorage && replayedBody) {
+      replayedBody = await blobStorage.retrieveIfOffloaded(replayedBody);
+    }
+
     return {
       role: 'FOLLOWER',
       statusCode: acquireResult.record.responseStatus ?? 200,
       headers: acquireResult.record.responseHeaders,
-      body: acquireResult.record.responseBody as T,
+      body: replayedBody as T,
       idempotencyStatus: 'HIT',
     };
   }
@@ -178,11 +200,16 @@ export async function executeIdempotentMutation<T = unknown>(
   const parkedWait = await parkingHandler.executeWait();
 
   if (parkedWait.status === 'RESOLVED') {
+    let replayedBody = parkedWait.body;
+    if (blobStorage && replayedBody) {
+      replayedBody = await blobStorage.retrieveIfOffloaded(replayedBody);
+    }
+
     return {
       role: 'FOLLOWER',
       statusCode: parkedWait.statusCode,
       headers: parkedWait.headers,
-      body: parkedWait.body as T,
+      body: replayedBody as T,
       idempotencyStatus: 'HIT',
     };
   }
