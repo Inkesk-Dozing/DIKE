@@ -3,6 +3,9 @@
 //! Provides root context and stream context hooks for inline idempotency key enforcement
 //! inside Envoy worker threads without sidecar latency.
 
+pub mod filter;
+
+use filter::RequestDigester;
 use log::{debug, info};
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
@@ -32,7 +35,7 @@ fn default_timeout_ms() -> u64 {
 
 #[cfg(target_arch = "wasm32")]
 proxy_wasm::main! {{
-    proxy_wasm::set_log_level(LogLevel::Info);
+    proxy_wasm::set_log_level(LogLevel::Debug);
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
         Box::new(DikeRootContext {
             config: DikeFilterConfig::default(),
@@ -76,7 +79,8 @@ impl RootContext for DikeRootContext {
             context_id,
             config: self.config.clone(),
             idempotency_key: None,
-            has_body: false,
+            digester: None,
+            body_fingerprint: None,
         }))
     }
 
@@ -89,7 +93,8 @@ pub struct DikeHttpContext {
     pub context_id: u32,
     pub config: DikeFilterConfig,
     pub idempotency_key: Option<String>,
-    pub has_body: bool,
+    pub digester: Option<RequestDigester>,
+    pub body_fingerprint: Option<String>,
 }
 
 impl Context for DikeHttpContext {}
@@ -102,21 +107,39 @@ impl HttpContext for DikeHttpContext {
         );
 
         if let Some(key_val) = self.get_http_request_header(&self.config.idempotency_header) {
-            if !key_val.trim().is_empty() {
-                self.idempotency_key = Some(key_val.trim().to_string());
+            let trimmed = key_val.trim();
+            if !trimmed.is_empty() {
+                self.idempotency_key = Some(trimmed.to_string());
                 debug!(
                     "[HttpContext {}] Found Idempotency-Key: {}",
-                    self.context_id,
-                    self.idempotency_key.as_ref().unwrap()
+                    self.context_id, trimmed
                 );
             }
         }
 
-        // If no idempotency key is present, pass through immediately
+        // If no idempotency key is present, pass through immediately (selective bypass)
         if self.idempotency_key.is_none() {
             return Action::Continue;
         }
 
+        // Extract HTTP method and path for payload digest seeding
+        let method = self
+            .get_http_request_header(":method")
+            .unwrap_or_else(|| "POST".to_string());
+        let path = self
+            .get_http_request_header(":path")
+            .unwrap_or_else(|| "/".to_string());
+
+        let mut digester = RequestDigester::new(&method, &path);
+
+        // If request has no body (end_of_stream on headers)
+        if end_of_stream {
+            let fingerprint = digester.finalize();
+            self.body_fingerprint = Some(fingerprint);
+            return Action::Continue;
+        }
+
+        self.digester = Some(digester);
         Action::Continue
     }
 
@@ -126,18 +149,37 @@ impl HttpContext for DikeHttpContext {
             self.context_id, body_size, end_of_stream
         );
 
+        // Fast bypass if request lacks Idempotency-Key
         if self.idempotency_key.is_none() {
             return Action::Continue;
         }
 
-        self.has_body = true;
+        let chunk = if body_size > 0 {
+            self.get_http_request_body(0, body_size)
+        } else {
+            None
+        };
 
-        if !end_of_stream {
-            // Buffer remaining chunks
-            return Action::Pause;
+        if let Some(ref mut digester) = self.digester {
+            if let Some(ref data) = chunk {
+                digester.update(data);
+            }
+
+            if end_of_stream {
+                let fingerprint = digester.finalize();
+                debug!(
+                    "[HttpContext {}] Finalized BLAKE3 fingerprint: {}",
+                    self.context_id, fingerprint
+                );
+                self.body_fingerprint = Some(fingerprint);
+
+                // Await lease resolution from control plane or continue upstream
+                return Action::Pause;
+            }
         }
 
-        Action::Continue
+        // In streaming chunk mode, pause filter to buffer full body for deterministic hashing
+        Action::Pause
     }
 
     fn on_http_response_headers(&mut self, _num_headers: usize, end_of_stream: bool) -> Action {
@@ -149,6 +191,9 @@ impl HttpContext for DikeHttpContext {
         // Stamp gateway signature header indicating DIKE WASM filter processed request
         if self.idempotency_key.is_some() {
             self.set_http_response_header("x-dike-mesh-processed", Some("true"));
+            if let Some(ref fp) = self.body_fingerprint {
+                self.set_http_response_header("x-dike-payload-digest", Some(fp));
+            }
         }
 
         Action::Continue
@@ -192,8 +237,7 @@ mod tests {
         assert!(root.on_vm_start(0));
         assert_eq!(root.get_type(), Some(ContextType::HttpContext));
 
-        let http_ctx = root.create_http_context(101).expect("http context created");
-        // Successfully created HttpContext
+        let _http_ctx = root.create_http_context(101).expect("http context created");
     }
 
     #[test]
@@ -202,10 +246,12 @@ mod tests {
             context_id: 42,
             config: DikeFilterConfig::default(),
             idempotency_key: None,
-            has_body: false,
+            digester: None,
+            body_fingerprint: None,
         };
         assert_eq!(ctx.context_id, 42);
         assert!(ctx.idempotency_key.is_none());
-        assert!(!ctx.has_body);
+        assert!(ctx.digester.is_none());
+        assert!(ctx.body_fingerprint.is_none());
     }
 }
