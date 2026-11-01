@@ -4,17 +4,22 @@
 //! inside Envoy worker threads without sidecar latency.
 
 pub mod filter;
+pub mod redis;
 
 use filter::RequestDigester;
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+use redis::{AsyncClusterClient, IdempotencyCheckRequest, LeaseStatus};
 use serde::Deserialize;
+use std::time::Duration;
 
 #[derive(Default, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DikeFilterConfig {
     #[serde(default = "default_header_name")]
     pub idempotency_header: String,
+    #[serde(default = "default_tenant_header")]
+    pub tenant_header: String,
     #[serde(default = "default_cluster_name")]
     pub dike_cluster: String,
     #[serde(default = "default_timeout_ms")]
@@ -23,6 +28,10 @@ pub struct DikeFilterConfig {
 
 fn default_header_name() -> String {
     "idempotency-key".to_string()
+}
+
+fn default_tenant_header() -> String {
+    "x-tenant-id".to_string()
 }
 
 fn default_cluster_name() -> String {
@@ -64,7 +73,7 @@ impl RootContext for DikeRootContext {
                         self.config = parsed;
                     }
                     Err(err) => {
-                        log::error!("Failed to parse DIKE WASM plugin configuration: {}", err);
+                        error!("Failed to parse DIKE WASM plugin configuration: {}", err);
                         return false;
                     }
                 }
@@ -78,9 +87,11 @@ impl RootContext for DikeRootContext {
         Some(Box::new(DikeHttpContext {
             context_id,
             config: self.config.clone(),
+            tenant_id: "default".to_string(),
             idempotency_key: None,
             digester: None,
             body_fingerprint: None,
+            call_token: None,
         }))
     }
 
@@ -92,12 +103,107 @@ impl RootContext for DikeRootContext {
 pub struct DikeHttpContext {
     pub context_id: u32,
     pub config: DikeFilterConfig,
+    pub tenant_id: String,
     pub idempotency_key: Option<String>,
     pub digester: Option<RequestDigester>,
     pub body_fingerprint: Option<String>,
+    pub call_token: Option<u32>,
 }
 
-impl Context for DikeHttpContext {}
+impl Context for DikeHttpContext {
+    fn on_http_call_response(&mut self, token_id: u32, _num_headers: usize, body_size: usize, _num_trailers: usize) {
+        debug!(
+            "[HttpContext {}] on_http_call_response, token={}, body_size={}",
+            self.context_id, token_id, body_size
+        );
+
+        if self.call_token != Some(token_id) {
+            warn!(
+                "[HttpContext {}] Unexpected async cluster token: expected {:?}, got {}",
+                self.context_id, self.call_token, token_id
+            );
+            return;
+        }
+
+        // Fetch response body
+        if let Some(body_bytes) = self.get_http_call_response_body(0, body_size) {
+            match AsyncClusterClient::parse_response(&body_bytes) {
+                Ok(resp) => {
+                    debug!(
+                        "[HttpContext {}] Cluster response status: {:?}",
+                        self.context_id, resp.status
+                    );
+
+                    match resp.status {
+                        LeaseStatus::Hit => {
+                            // Instant short-circuit replay
+                            let status = resp.cached_status_code.unwrap_or(200);
+                            let body = resp.cached_body.unwrap_or_default();
+                            let mut headers = vec![
+                                ("content-type", "application/json"),
+                                ("idempotency-status", "HIT"),
+                                ("x-dike-mesh-processed", "true"),
+                            ];
+                            if let Some(ref fp) = self.body_fingerprint {
+                                headers.push(("x-dike-payload-digest", fp.as_str()));
+                            }
+
+                            self.send_http_response(
+                                status as u32,
+                                headers,
+                                Some(body.as_bytes()),
+                            );
+                            return;
+                        }
+                        LeaseStatus::Mismatch => {
+                            // HTTP 422 Fingerprint Mismatch
+                            let err_body = r#"{"type":"https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422","title":"Unprocessable Entity","status":422,"detail":"Idempotency-Key reuse with mutated payload fingerprint"}"#;
+                            self.send_http_response(
+                                422,
+                                vec![
+                                    ("content-type", "application/problem+json"),
+                                    ("idempotency-status", "MISMATCH"),
+                                ],
+                                Some(err_body.as_bytes()),
+                            );
+                            return;
+                        }
+                        LeaseStatus::Acquired => {
+                            // Leader acquired: resume downstream request towards upstream service
+                            debug!(
+                                "[HttpContext {}] Leader acquired lease; resuming request to upstream",
+                                self.context_id
+                            );
+                            self.resume_http_request();
+                            return;
+                        }
+                        LeaseStatus::Error => {
+                            warn!(
+                                "[HttpContext {}] Control plane returned error; failing open and resuming upstream",
+                                self.context_id
+                            );
+                            self.resume_http_request();
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "[HttpContext {}] Failed to parse cluster response: {}",
+                        self.context_id, e
+                    );
+                    self.resume_http_request();
+                }
+            }
+        } else {
+            warn!(
+                "[HttpContext {}] Async cluster call response empty or timed out; resuming request upstream",
+                self.context_id
+            );
+            self.resume_http_request();
+        }
+    }
+}
 
 impl HttpContext for DikeHttpContext {
     fn on_http_request_headers(&mut self, _num_headers: usize, end_of_stream: bool) -> Action {
@@ -105,6 +211,14 @@ impl HttpContext for DikeHttpContext {
             "[HttpContext {}] on_http_request_headers, end_of_stream={}",
             self.context_id, end_of_stream
         );
+
+        // Extract tenant ID if provided
+        if let Some(tenant) = self.get_http_request_header(&self.config.tenant_header) {
+            let trimmed = tenant.trim();
+            if !trimmed.is_empty() {
+                self.tenant_id = trimmed.to_string();
+            }
+        }
 
         if let Some(key_val) = self.get_http_request_header(&self.config.idempotency_header) {
             let trimmed = key_val.trim();
@@ -136,7 +250,7 @@ impl HttpContext for DikeHttpContext {
         if end_of_stream {
             let fingerprint = digester.finalize();
             self.body_fingerprint = Some(fingerprint);
-            return Action::Continue;
+            return self.dispatch_lease_check();
         }
 
         self.digester = Some(digester);
@@ -173,8 +287,8 @@ impl HttpContext for DikeHttpContext {
                 );
                 self.body_fingerprint = Some(fingerprint);
 
-                // Await lease resolution from control plane or continue upstream
-                return Action::Pause;
+                // Dispatch async check to DIKE control plane / Redis cluster
+                return self.dispatch_lease_check();
             }
         }
 
@@ -205,6 +319,66 @@ impl HttpContext for DikeHttpContext {
             self.context_id, body_size, end_of_stream
         );
         Action::Continue
+    }
+}
+
+impl DikeHttpContext {
+    fn dispatch_lease_check(&mut self) -> Action {
+        let key = match self.idempotency_key {
+            Some(ref k) => k.clone(),
+            None => return Action::Continue,
+        };
+        let hash = self.body_fingerprint.clone().unwrap_or_default();
+
+        let req = IdempotencyCheckRequest {
+            tenant_id: self.tenant_id.clone(),
+            idempotency_key: key,
+            payload_hash: hash,
+        };
+
+        let body = match AsyncClusterClient::prepare_dispatch_body(&req) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("[HttpContext {}] Failed to serialize check req: {}", self.context_id, e);
+                return Action::Continue;
+            }
+        };
+
+        let headers = vec![
+            (":method", "POST"),
+            (":path", "/v1/idempotency/check"),
+            (":authority", self.config.dike_cluster.as_str()),
+            ("content-type", "application/json"),
+        ];
+
+        debug!(
+            "[HttpContext {}] Dispatching async cluster call to '{}'",
+            self.context_id, self.config.dike_cluster
+        );
+
+        match self.dispatch_http_call(
+            &self.config.dike_cluster,
+            headers,
+            Some(&body),
+            vec![],
+            Duration::from_millis(self.config.timeout_ms),
+        ) {
+            Ok(token) => {
+                self.call_token = Some(token);
+                debug!(
+                    "[HttpContext {}] Dispatched async call successfully with token={}",
+                    self.context_id, token
+                );
+                Action::Pause
+            }
+            Err(e) => {
+                warn!(
+                    "[HttpContext {}] Failed to dispatch async cluster call: {:?}. Failing open.",
+                    self.context_id, e
+                );
+                Action::Continue
+            }
+        }
     }
 }
 
@@ -245,13 +419,16 @@ mod tests {
         let ctx = DikeHttpContext {
             context_id: 42,
             config: DikeFilterConfig::default(),
+            tenant_id: "default".to_string(),
             idempotency_key: None,
             digester: None,
             body_fingerprint: None,
+            call_token: None,
         };
         assert_eq!(ctx.context_id, 42);
         assert!(ctx.idempotency_key.is_none());
         assert!(ctx.digester.is_none());
         assert!(ctx.body_fingerprint.is_none());
+        assert!(ctx.call_token.is_none());
     }
 }
