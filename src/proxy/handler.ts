@@ -174,6 +174,8 @@ export const transparentReverseProxyPlugin: FastifyPluginAsync<ReverseProxyPlugi
 
     if (reply.setIdempotencyStatus) {
       reply.setIdempotencyStatus(executionResult.idempotencyStatus);
+    } else {
+      reply.header('idempotency-status', executionResult.idempotencyStatus);
     }
 
     if (executionResult.headers) {
