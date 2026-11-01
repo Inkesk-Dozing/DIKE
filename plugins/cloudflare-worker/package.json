@@ -1,0 +1,12 @@
+{
+  "name": "@inkesk/dike-cloudflare-worker",
+  "version": "0.1.0",
+  "description": "Cloudflare Edge Worker Idempotency Gate for DIKE",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": ["cloudflare", "workers", "idempotency", "dike", "edge"],
+  "author": "Inkesk <contact@inkesk.com>",
+  "license": "Apache-2.0"
+}
