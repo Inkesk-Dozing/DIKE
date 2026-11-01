@@ -12,13 +12,16 @@ import { IIdempotencyStorage } from '../storage/interface.js';
 import { MemoryStorageAdapter } from '../storage/memory.js';
 import { ietfHeadersPlugin } from './plugins/ietf_headers.js';
 import { idempotencyRoutes } from './routes/idempotency.js';
+import { attestVerifyRoutes } from './routes/attest.js';
 import { socketDrain, DrainManager } from './drain.js';
+import { AttestationReceiptSigner } from '../security/attest.js';
 import { DEFAULT_REDACT_PATHS, generateTraceId, REDACTED_MASK } from '../utils/logger.js';
 
 export interface AppOptions {
   readonly config?: Partial<ServerConfig> | undefined;
   readonly storage?: IIdempotencyStorage | undefined;
   readonly drainManager?: DrainManager | undefined;
+  readonly attestationSigner?: AttestationReceiptSigner | undefined;
 }
 
 export interface StorageHealthCapable {
@@ -31,6 +34,7 @@ declare module 'fastify' {
   }
   interface FastifyInstance {
     drainManager: DrainManager;
+    attestationSigner?: AttestationReceiptSigner | undefined;
   }
 }
 
@@ -50,38 +54,51 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               censor: REDACTED_MASK,
             },
           },
-    genReqId: (req) => (req.headers['x-trace-id'] as string) || generateTraceId(),
-    requestIdHeader: 'x-trace-id',
+    disableRequestLogging: config.LOG_LEVEL === 'silent',
+    connectionTimeout: 10_000,
+    keepAliveTimeout: 5_000,
   });
 
-  // Security Headers and Cross-Origin Resource Sharing
+  // Attach Trace ID Correlation Hook
+  app.addHook('onRequest', async (req: FastifyRequest, reply: FastifyReply) => {
+    const traceIdHeader = req.headers['x-trace-id'];
+    const traceId = (Array.isArray(traceIdHeader) ? traceIdHeader[0] : traceIdHeader) || generateTraceId();
+    req.traceId = traceId;
+    reply.header('x-trace-id', traceId);
+  });
+
+  // Core Security Plugins
   await app.register(helmet, {
     contentSecurityPolicy: false,
   });
 
   await app.register(cors, {
-    origin: true,
-    credentials: true,
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Client-Id', 'X-Tenant-Id', 'X-Trace-Id'],
+    exposedHeaders: ['Idempotency-Key', 'Idempotency-Status', 'X-Trace-Id', 'X-DIKE-Attestation'],
   });
 
-  // Trace ID Decorator and Response Header Hook
-  app.addHook('onRequest', async (req: FastifyRequest, reply: FastifyReply) => {
-    req.traceId = req.id;
-    reply.header('x-trace-id', req.id);
+  // Zero-Downtime Socket Drainage Engine
+  await app.register(socketDrain, {
+    drainManager,
   });
 
-  // Rolling Zero-Downtime Socket Drainage Plugin
-  await app.register(socketDrain, { drainManager });
-
-  // IETF Idempotency-Key Standard HTTP Header Compliance Plugin
+  // IETF Idempotency Header Lifecycle Hook
   await app.register(ietfHeadersPlugin);
 
-  // Global Context Decorators
+  // Decorators
   app.decorate('config', config);
   app.decorate('storage', storage);
+  if (options.attestationSigner) {
+    app.decorate('attestationSigner', options.attestationSigner);
+  }
 
   // Register Core REST Routes
   await app.register(idempotencyRoutes);
+  await app.register(attestVerifyRoutes, {
+    attestationSigner: options.attestationSigner,
+  });
 
   // Standardized Error Handler
   app.setErrorHandler((error: Error & { statusCode?: number }, _req: FastifyRequest, reply: FastifyReply) => {

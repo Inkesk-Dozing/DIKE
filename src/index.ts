@@ -28,6 +28,7 @@ export * from './server/config.js';
 export * from './server/app.js';
 export * from './server/drain.js';
 export * from './server/routes/idempotency.js';
+export * from './server/routes/attest.js';
 export * from './server/plugins/ietf_headers.js';
 export * from './proxy/upstream.js';
 export * from './proxy/interceptor.js';
